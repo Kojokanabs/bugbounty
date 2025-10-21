@@ -1,0 +1,135 @@
+# Authentication & Authorization — Detailed Bug Bounty Report
+
+**Target:** localhost (Authentication2 / Authentication3 / IDOR / API labs)  
+**Author:** Enoch Kanabia Ali  
+**Date:** 2025-10-20
+
+---
+
+## Executive summary
+This report documents multiple authentication and authorization weaknesses found in a local lab environment:
+- MFA flow that permits reuse of second-factor codes across usernames (account takeover).
+- No effective rate limiting or lockouts allowing credential-stuffing/clusterbomb attacks.
+- IDOR due to predictable identifiers and missing ownership checks.
+- API-level issues: malformed JSON examples, tokens in wrong location, weak JWT handling.
+
+Each finding includes description, concise reproduction steps, PoC commands, impact assessment, root cause and remediation.
+
+---
+
+## Finding 1 — MFA flow abuse (Authentication2)
+
+**Summary:** MFA code issued after credentials are accepted is not bound to the initiating session or username. An attacker can reuse an MFA code issued for `jessamy` to authenticate as `jeremy`.
+
+**Reproduction (concise):**
+1. Start login for `jessamy` (`jessamy:pasta`) and intercept the MFA submission request.
+2. Capture the POST/GET that sends the MFA code.
+3. Modify the username field from `jessamy` → `jeremy` while keeping the same MFA code.
+4. Forward the request — if accepted, session is established as `jeremy`.
+
+**PoC:** Use Burp Proxy -> Repeater. Replace username in the intercepted MFA submission request.
+
+**Impact:** High — account takeover, data access, impersonation.
+
+**Root cause:** MFA not bound to session/user; codes reusable and not single-use.
+
+**Remediation:**
+- Bind MFA codes to authentication session and user server-side.
+- Make MFA codes single-use and short-lived.
+- Log and alert on cross-user MFA reuse.
+
+---
+
+## Finding 2 — Credential-stuffing / clusterbomb (Authentication3)
+
+**Summary:** Login endpoint supports automated testing with separate username and password lists. Lack of adequate throttling makes large-scale credential stuffing feasible.
+
+**Reproduction (concise):**
+1. Place request template `auth3_req.txt` containing `UFUZZ` and `PFUZZ`.
+2. Run ffuf in clusterbomb mode against the login endpoint using username/password lists.
+
+**Example ffuf command:**
+```bash
+ffuf -request auth3_req.txt -request-proto http \
+  -mode clusterbomb \
+  -w /usr/share/seclist/userlist.txt:UFUZZ \
+  -w /usr/sshare/seclists/passlist.txt:PFUZZ \
+  -fw 1270
+
+## Impact: High — mass account compromise if credentials reused.
+
+## Root cause: No progressive delays, lockouts, or robust anomaly detection.
+
+## Remediation:
+
+* Implement rate limiting and progressive back-off.
+
+* CAPTCHAs/device fingerprinting for suspicious flows.
+
+* Enforce MFA for high-value accounts.
+
+## Finding 3 — IDOR (Insecure Direct Object Reference)
+
+Summary: Application exposes predictable account IDs and fails to validate ownership on access/modification.
+
+Reproduction (concise):
+
+1 Generate numeric wordlist:
+
+python3 -c "for i in range(1,5000): print(i)" > num.txt
+
+2 Run ffuf:
+
+ffuf -u 'http://localhost/labs/e0x02.php?account=FUZZ' -w num.txt -mr 'admin'
+
+* Impact: High — unauthorized access and modification of other users’ data.
+
+* Root cause: Missing server-side authorization checks.
+
+* Remediation:
+ - Always verify object.owner == current_user before returning or modifying resources.
+ 
+ - Prefer indirect references (opaque tokens) to direct sequential IDs.
+
+##Finding 4 — API token handling & JSON issues
+
+Summary: Several examples showed invalid JSON payloads and token placement issues. Server responded with Token missing or Bio data missing.
+
+## Common mistakes:
+
+* Unquoted JSON keys: {token: "..."} (invalid).
+
+* Extra quotes or malformed values.
+
+Token placed in body while server expects Authorization header.
+
+* correct header:
+curl -X PUT -H "Content-Type: application/json" \
+ -H "Authorization: Bearer <JWT>" \
+ -d '{"username":"jessamy","bio":"New bio information."}' \
+ http://localhost/labs/api/account.php
+
+
+curl -X PUT -H "Content-Type: application/json" \
+ -d '{"token":"<JWT>","username":"jessamy","bio":"New bio information."}' \
+ http://localhost/labs/api/account.php
+
+* Impact: Medium — failed updates and potential token replay/acceptance if 
+server accepts weak tokens.
+
+* Remediation:
+
+- Standardize token usage via Authorization: Bearer.
+
+- Strictly validate JSON and JWT signatures; reject alg:none.
+
+## PoC artifacts & sample files
+
+See /pocs/ for:
+
+* num.py — generate numeric wordlist.
+
+* auth3_req.txt — ffuf raw request template (clusterbomb).
+
+* sample_num.txt — sample numeric list.
+
